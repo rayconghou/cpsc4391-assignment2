@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 from pathlib import Path
@@ -54,6 +55,48 @@ def test_add_query_ranking_and_k_cap(tmp_path: Path) -> None:
         assert len(r_all) == 3
     finally:
         db.close()
+
+
+def test_embedding_cache_survives_reopen(tmp_path: Path) -> None:
+    """Vectors + fitted vectorizer persist in SQLite; reopen skips refit path."""
+    db_path = tmp_path / "persist.sqlite"
+    db = VectorDB(
+        db_path,
+        max_features=100,
+        min_df=1,
+        num_tables=4,
+        num_hyperplanes=6,
+        random_seed=1,
+    )
+    try:
+        db.add("alpha beta")
+        db.add("gamma delta")
+        r1 = db.query("beta", k=2)
+    finally:
+        db.close()
+
+    db2 = VectorDB(
+        db_path,
+        max_features=100,
+        min_df=1,
+        num_tables=4,
+        num_hyperplanes=6,
+        random_seed=1,
+    )
+    try:
+        r2 = db2.query("beta", k=2)
+        assert len(r1) == len(r2)
+        for a, b in zip(r1, r2, strict=True):
+            assert a.id == b.id and a.text == b.text
+            assert abs(a.score - b.score) < 1e-9
+    finally:
+        db2.close()
+
+    con = sqlite3.connect(db_path)
+    try:
+        assert con.execute("SELECT COUNT(*) FROM embedding_cache").fetchone()[0] == 1
+    finally:
+        con.close()
 
 
 def test_duplicate_texts_distinct_ids(tmp_path: Path) -> None:

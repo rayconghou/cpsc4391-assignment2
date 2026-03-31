@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import hashlib
+import io
+import json
+import pickle
 from pathlib import Path
 
 import numpy as np
@@ -13,11 +17,23 @@ from vectordb.models import QueryResult
 from vectordb.storage import DocumentStore
 
 
+def _csr_to_bytes(x: sparse.csr_matrix) -> bytes:
+    buf = io.BytesIO()
+    sparse.save_npz(buf, x, compressed=True)
+    return buf.getvalue()
+
+
+def _csr_from_bytes(data: bytes) -> sparse.csr_matrix:
+    return sparse.load_npz(io.BytesIO(data))
+
+
 class VectorDB:
     """
     TF-IDF embeddings, L2-normalized; LSH for candidate generation;
-    cosine (dot on unit vectors) for reranking. SQLite stores ids + text only;
-    vectors and LSH are rebuilt from the full corpus on each add/query.
+    cosine (dot on unit vectors) for reranking. SQLite stores document text
+    and a persisted cache of the fitted vectorizer plus L2-normalized sparse
+    document matrix; the cache is invalidated when the corpus or TF-IDF
+    settings no longer match.
     """
 
     def __init__(
@@ -52,9 +68,24 @@ class VectorDB:
     def close(self) -> None:
         self._store.close()
 
+    def _corpus_fingerprint(self, rows: list[tuple[int, str]]) -> str:
+        v = self._vectorizer
+        payload = {
+            "rows": rows,
+            "tfidf": {
+                "max_features": v.max_features,
+                "min_df": v.min_df,
+                "max_df": v.max_df,
+                "ngram_range": list(v.ngram_range),
+            },
+        }
+        canonical = json.dumps(payload, sort_keys=True, ensure_ascii=False)
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
     def _rebuild(self) -> None:
         rows = self._store.load_all_ordered()
         if not rows:
+            self._store.clear_embedding_cache()
             self._X_norm = None
             self._row_doc_ids = None
             self._row_texts = None
@@ -63,6 +94,34 @@ class VectorDB:
 
         doc_ids = [r[0] for r in rows]
         texts = [r[1] for r in rows]
+        fp = self._corpus_fingerprint(rows)
+
+        cached = self._store.load_embedding_cache()
+        if cached is not None:
+            stored_fp, x_blob, vec_blob = cached
+            if stored_fp == fp:
+                try:
+                    X_norm = _csr_from_bytes(x_blob)
+                    loaded = pickle.loads(vec_blob)
+                    if not isinstance(loaded, TfidfVectorizer):
+                        raise TypeError("cached vectorizer has wrong type")
+                    self._vectorizer = loaded
+                    if not sparse.isspmatrix_csr(X_norm):
+                        X_norm = X_norm.tocsr()
+                    self._X_norm = X_norm
+                    self._row_doc_ids = np.asarray(doc_ids, dtype=np.int64)
+                    self._row_texts = texts
+                    lsh = HyperplaneLSH(
+                        self._num_tables,
+                        self._num_hyperplanes,
+                        RandomState(self._seed),
+                    )
+                    lsh.fit(self._X_norm)
+                    self._lsh = lsh
+                    return
+                except Exception:
+                    pass
+
         X = self._vectorizer.fit_transform(texts)
         X_norm = normalize(X, norm="l2", copy=True)
         if not sparse.isspmatrix_csr(X_norm):
@@ -79,6 +138,15 @@ class VectorDB:
         )
         lsh.fit(X_norm)
         self._lsh = lsh
+
+        try:
+            self._store.save_embedding_cache(
+                fp,
+                _csr_to_bytes(X_norm),
+                pickle.dumps(self._vectorizer, protocol=pickle.HIGHEST_PROTOCOL),
+            )
+        except Exception:
+            pass
 
     def add(self, text: str) -> int:
         doc_id = self._store.add(text)

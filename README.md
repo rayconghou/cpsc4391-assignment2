@@ -1,6 +1,6 @@
 # Vector database (CPSC 4391 Assignment 2)
 
-Local **TF-IDF** embeddings (L2-normalized), **random hyperplane LSH** for approximate candidate retrieval, **cosine similarity** (dot product on unit vectors) for reranking, and **SQLite** for persistent raw text + integer ids. Vectors and the LSH index are **rebuilt from the full corpus** whenever you **add** or **query** (no stale vectors in the database file).
+Local **TF-IDF** embeddings (L2-normalized), **random hyperplane LSH** for approximate candidate retrieval, **cosine similarity** (dot product on unit vectors) for reranking, and **SQLite** for persistent raw text + integer ids. The **fitted TF-IDF vectorizer** and **L2-normalized document matrix** are also **persisted** in SQLite (`embedding_cache`); on each **add** or **query** the corpus is checked and embeddings are **recomputed only** when the text or TF-IDF settings no longer match the cache (the LSH tables are always **rebuilt in memory** from the matrix).
 
 ## Requirements
 
@@ -53,7 +53,7 @@ python -m vectordb query --db ./data.sqlite -k 3 --json "hello"
 
 - `vectordb/core.py` — `VectorDB` orchestration
 - `vectordb/lsh.py` — hyperplane LSH
-- `vectordb/storage.py` — SQLite document table
+- `vectordb/storage.py` — SQLite document table + embedding cache (vector matrix + vectorizer blobs)
 - `vectordb/cli.py` — `add` / `query` subcommands
 
 ## Submission zip
